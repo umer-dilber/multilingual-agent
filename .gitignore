@@ -1,0 +1,6 @@
+.env
+.venv
+uv.lock
+.pytest*
+*__pycache__*
+agent_starter_python.egg-info/
