@@ -1,6 +1,5 @@
 import logging
 import textwrap
-from collections.abc import AsyncIterable
 
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -8,30 +7,22 @@ from livekit.agents import (
     AgentServer,
     AgentSession,
     JobContext,
-    ModelSettings,
+    LanguageCode,
     TurnHandlingOptions,
+    UserInputTranscribedEvent,
     cli,
     inference,
     llm,
     room_io,
-    stt,
 )
 from livekit.agents.voice.generation import update_instructions
 from livekit.plugins import ai_coustics
-from livekit import rtc
-
-from language_policy import (
-    TurnLanguage,
-    classify_turn,
-    codes_from_speech_fields,
-    instructions_with_language,
-)
 
 logger = logging.getLogger("agent")
 
 load_dotenv(".env")
 
-BASE_INSTRUCTIONS = textwrap.dedent(
+INSTRUCTIONS = textwrap.dedent(
     """\
     You are a friendly, reliable voice assistant that answers questions, explains topics, and completes tasks with available tools.
 
@@ -45,6 +36,14 @@ BASE_INSTRUCTIONS = textwrap.dedent(
     - Spell out numbers, phone numbers, or email addresses
     - Omit `https://` and other formatting if listing a web url
     - Avoid acronyms and words with unclear pronunciation, when possible.
+
+    # Language
+
+    - Reply in the language of the user's latest utterance.
+    - English stays English. Spanish stays Spanish.
+    - If they mix Spanish and English, mix the same way. Do not flatten the reply into only one language.
+    - If this turn is too short or ambiguous, such as okay, sí, or mm, keep the language of the previous user turn.
+    - Default to English only when there is no prior turn to copy.
 
     # Conversational flow
 
@@ -67,75 +66,61 @@ BASE_INSTRUCTIONS = textwrap.dedent(
     """
 )
 
+_TURN_LANGUAGE = {
+    "en": (
+        "The user spoke English this turn. Reply in English. "
+        "If they mixed Spanish and English, match that mix. "
+        "Do not switch the whole reply into Spanish."
+    ),
+    "es": (
+        "The user spoke Spanish this turn. Reply in Spanish. "
+        "If they mixed Spanish and English, match that mix. "
+        "Keep product names in their original language. "
+        "Do not switch the whole reply into English."
+    ),
+}
+
+
+def _stt_language(language: LanguageCode | None) -> str | None:
+    if not language:
+        return None
+    code = language.language
+    if code in {"en", "es"}:
+        return code
+    return None
+
+
+def _instructions_for(code: str) -> str:
+    return f"{INSTRUCTIONS.rstrip()}\n\n# Language for this turn\n{_TURN_LANGUAGE[code]}"
+
 
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
             llm=inference.LLM(model="google/gemma-4-31b-it"),
-            instructions=BASE_INSTRUCTIONS,
+            instructions=INSTRUCTIONS,
         )
-        self._turn_stt_codes: list[str] = []
-        self._applied_language: TurnLanguage | None = None
+        self._heard_language = "en"
+        self._applied_language: str | None = None
 
-    def _speech_codes(self, speech: stt.SpeechData) -> list[str]:
-        return codes_from_speech_fields(
-            language=speech.language,
-            source_languages=speech.source_languages,
-            metadata=speech.metadata,
-        )
+    async def on_enter(self) -> None:
+        def _on_transcript(ev: UserInputTranscribedEvent) -> None:
+            code = _stt_language(ev.language)
+            if code:
+                self._heard_language = code
 
-    async def _apply_language(
-        self,
-        *,
-        transcript: str,
-        extra_codes: list[str] | None = None,
-        chat_ctx: llm.ChatContext | None = None,
-    ) -> TurnLanguage:
-        codes = list(dict.fromkeys([*self._turn_stt_codes, *(extra_codes or [])]))
-        mode = classify_turn(transcript, codes)
-        instructions = instructions_with_language(BASE_INSTRUCTIONS, mode)
-        if mode != self._applied_language:
-            logger.info("Updating reply language to %s (stt=%s)", mode, codes)
-            await self.update_instructions(instructions)
-            self._applied_language = mode
-        if chat_ctx is not None:
-            update_instructions(chat_ctx, instructions=instructions, add_if_missing=True)
-        return mode
-
-    async def stt_node(
-        self, audio: AsyncIterable[rtc.AudioFrame], model_settings: ModelSettings
-    ) -> AsyncIterable[stt.SpeechEvent]:
-        async for event in Agent.default.stt_node(self, audio, model_settings):
-            if event.type == stt.SpeechEventType.START_OF_SPEECH:
-                self._turn_stt_codes = []
-            elif (
-                event.type
-                in (
-                    stt.SpeechEventType.INTERIM_TRANSCRIPT,
-                    stt.SpeechEventType.PREFLIGHT_TRANSCRIPT,
-                    stt.SpeechEventType.FINAL_TRANSCRIPT,
-                )
-                and event.alternatives
-            ):
-                speech = event.alternatives[0]
-                new_codes = self._speech_codes(speech)
-                self._turn_stt_codes = list(dict.fromkeys([*self._turn_stt_codes, *new_codes]))
-                if speech.text and (
-                    event.type != stt.SpeechEventType.INTERIM_TRANSCRIPT or new_codes
-                ):
-                    await self._apply_language(
-                        transcript=speech.text,
-                        extra_codes=new_codes,
-                    )
-            yield event
+        self.session.on("user_input_transcribed", _on_transcript)
 
     async def on_user_turn_completed(
         self, turn_ctx: llm.ChatContext, new_message: llm.ChatMessage
     ) -> None:
-        await self._apply_language(
-            transcript=new_message.text_content or "",
-            chat_ctx=turn_ctx,
-        )
+        code = self._heard_language
+        instructions = _instructions_for(code)
+        if code != self._applied_language:
+            logger.info("Updating reply language to %s", code)
+            await self.update_instructions(instructions)
+            self._applied_language = code
+        update_instructions(turn_ctx, instructions=instructions, add_if_missing=True)
 
 
 server = AgentServer()
